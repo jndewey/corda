@@ -124,7 +124,7 @@ class PortfolioApiUtils(private val ownParty: Party) {
         return json {
             obj(
                     "fixedLeg" to obj(
-                            "fixedRatePayer" to state.buyer.name,
+                            "fixedRatePayer" to state.buyer.name!!,
                             "notional" to obj(
                                     "token" to fixedLeg.currency.code,
                                     "quantity" to fixedLeg.notionalSchedule.amount.initialValue
@@ -140,7 +140,7 @@ class PortfolioApiUtils(private val ownParty: Party) {
                             "paymentCalendar" to obj() // TODO
                     ),
                     "floatingLeg" to obj(
-                            "floatingRatePayer" to state.seller.name,
+                            "floatingRatePayer" to state.seller.name!!,
                             "notional" to obj(
                                     "token" to floatingLeg.currency.code,
                                     "quantity" to floatingLeg.notionalSchedule.amount.initialValue

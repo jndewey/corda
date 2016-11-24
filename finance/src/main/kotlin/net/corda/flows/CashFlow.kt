@@ -45,10 +45,11 @@ class CashFlow(val command: CashCommand, override val progressTracker: ProgressT
     private fun initiatePayment(req: CashCommand.PayCash): CashFlowResult {
         progressTracker.currentStep = PAYING
         val builder: TransactionBuilder = TransactionType.General.Builder(null)
+        val issuer = req.amount.token.issuer.party.resolveParty(serviceHub.identityService) ?: return CashFlowResult.Failed("Unknown issuing party")
         // TODO: Have some way of restricting this to states the caller controls
         try {
             val (spendTX, keysForSigning) = serviceHub.vaultService.generateSpend(builder,
-                    req.amount.withoutIssuer(), req.recipient.owningKey, setOf(req.amount.token.issuer.party))
+                    req.amount.withoutIssuer(), req.recipient.owningKey, setOf(issuer))
 
             keysForSigning.keys.forEach {
                 val key = serviceHub.keyManagementService.keys[it] ?: throw IllegalStateException("Could not find signing key for ${it.toStringShort()}")
@@ -73,7 +74,7 @@ class CashFlow(val command: CashCommand, override val progressTracker: ProgressT
         progressTracker.currentStep = EXITING
         val builder: TransactionBuilder = TransactionType.General.Builder(null)
         try {
-            val issuer = PartyAndReference(serviceHub.myInfo.legalIdentity, req.issueRef)
+            val issuer = PartyAndReference(serviceHub.myInfo.legalIdentity.toState(), req.issueRef)
             Cash().generateExit(builder, req.amount.issuedBy(issuer),
                     serviceHub.vaultService.currentVault.statesOfType<Cash.State>().filter { it.state.data.owner == issuer.party.owningKey })
             val myKey = serviceHub.legalIdentityKey
@@ -108,7 +109,7 @@ class CashFlow(val command: CashCommand, override val progressTracker: ProgressT
     private fun issueCash(req: CashCommand.IssueCash): CashFlowResult {
         progressTracker.currentStep = ISSUING
         val builder: TransactionBuilder = TransactionType.General.Builder(notary = null)
-        val issuer = PartyAndReference(serviceHub.myInfo.legalIdentity, req.issueRef)
+        val issuer = PartyAndReference(serviceHub.myInfo.legalIdentity.toState(), req.issueRef)
         Cash().generateIssue(builder, req.amount.issuedBy(issuer), req.recipient.owningKey, req.notary)
         val myKey = serviceHub.legalIdentityKey
         builder.signWith(myKey)
