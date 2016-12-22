@@ -45,6 +45,7 @@ import net.corda.node.services.transactions.*
 import net.corda.node.services.vault.CashBalanceAsMetricsObserver
 import net.corda.node.services.vault.NodeVaultService
 import net.corda.node.utilities.AddOrRemove
+import net.corda.node.utilities.AddOrRemove.ADD
 import net.corda.node.utilities.AffinityExecutor
 import net.corda.node.utilities.configureDatabase
 import net.corda.node.utilities.databaseTransaction
@@ -71,8 +72,9 @@ import net.corda.core.crypto.generateKeyPair as cryptoGenerateKeyPair
 // TODO: Where this node is the initial network map service, currently no networkMapService is provided.
 // In theory the NodeInfo for the node should be passed in, instead, however currently this is constructed by the
 // AbstractNode. It should be possible to generate the NodeInfo outside of AbstractNode, so it can be passed in.
-abstract class AbstractNode(open val configuration: NodeConfiguration, val networkMapService: SingleMessageRecipient?,
-                            val advertisedServices: Set<ServiceInfo>, val platformClock: Clock) : SingletonSerializeAsToken() {
+abstract class AbstractNode(open val configuration: NodeConfiguration,
+                            val advertisedServices: Set<ServiceInfo>,
+                            val platformClock: Clock) : SingletonSerializeAsToken() {
     companion object {
         val PRIVATE_KEY_FILE_NAME = "identity-private-key"
         val PUBLIC_IDENTITY_FILE_NAME = "identity-public"
@@ -94,6 +96,7 @@ abstract class AbstractNode(open val configuration: NodeConfiguration, val netwo
     var networkMapSeq: Long = 1
 
     protected abstract val log: Logger
+    protected abstract val networkMapAddress: SingleMessageRecipient?
 
     // We will run as much stuff in this single thread as possible to keep the risk of thread safety bugs low during the
     // low-performance prototyping period.
@@ -376,22 +379,24 @@ abstract class AbstractNode(open val configuration: NodeConfiguration, val netwo
      * updates) if one has been supplied.
      */
     private fun registerWithNetworkMap(): ListenableFuture<Unit> {
-        require(networkMapService != null || NetworkMapService.type in advertisedServices.map { it.type }) {
+        require(networkMapAddress != null || NetworkMapService.type in advertisedServices.map { it.type }) {
             "Initial network map address must indicate a node that provides a network map service"
         }
         services.networkMapCache.addNode(info)
         // In the unit test environment, we may run without any network map service sometimes.
-        if (networkMapService == null && inNodeNetworkMapService == null) {
+        if (networkMapAddress == null && inNodeNetworkMapService == null) {
             services.networkMapCache.runWithoutMapService()
             return noNetworkMapConfigured()
         }
-        return registerWithNetworkMap(networkMapService ?: info.address)
+        return registerWithNetworkMap(networkMapAddress ?: info.address)
     }
 
-    private fun registerWithNetworkMap(networkMapServiceAddress: SingleMessageRecipient): ListenableFuture<Unit> {
+    private fun registerWithNetworkMap(networkMapAddress: SingleMessageRecipient): ListenableFuture<Unit> {
         // Register for updates, even if we're the one running the network map.
-        updateRegistration(networkMapServiceAddress, AddOrRemove.ADD)
-        return services.networkMapCache.addMapService(net, networkMapServiceAddress, true, null)
+        return updateRegistration(networkMapAddress, ADD).flatMap { response ->
+            check(response.success) { "We were unable to register with the network map service" }
+            services.networkMapCache.addMapService(net, networkMapAddress, true, null)
+        }
     }
 
     /** This is overriden by the mock node implementation to enable operation without any network map service */

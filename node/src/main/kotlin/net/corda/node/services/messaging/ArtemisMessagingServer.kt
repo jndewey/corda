@@ -2,23 +2,22 @@ package net.corda.node.services.messaging
 
 import com.google.common.net.HostAndPort
 import net.corda.core.ThreadBox
-import net.corda.core.crypto.AddressFormatException
-import net.corda.core.crypto.CompositeKey
-import net.corda.core.crypto.X509Utilities
+import net.corda.core.crypto.*
 import net.corda.core.crypto.X509Utilities.CORDA_CLIENT_CA
 import net.corda.core.crypto.X509Utilities.CORDA_ROOT_CA
-import net.corda.core.crypto.newSecureRandom
 import net.corda.core.div
+import net.corda.core.minutes
 import net.corda.core.node.NodeInfo
 import net.corda.core.node.services.NetworkMapCache
 import net.corda.core.node.services.NetworkMapCache.MapChange
+import net.corda.core.seconds
 import net.corda.core.utilities.debug
 import net.corda.core.utilities.loggerFor
 import net.corda.node.printBasicNodeInfo
 import net.corda.node.services.RPCUserService
 import net.corda.node.services.config.NodeConfiguration
-import net.corda.node.services.messaging.ArtemisMessagingComponent.ConnectionDirection.INBOUND
-import net.corda.node.services.messaging.ArtemisMessagingComponent.ConnectionDirection.OUTBOUND
+import net.corda.node.services.messaging.ArtemisMessagingComponent.ConnectionDirection.Inbound
+import net.corda.node.services.messaging.ArtemisMessagingComponent.ConnectionDirection.Outbound
 import net.corda.node.services.messaging.ArtemisMessagingServer.NodeLoginModule.Companion.NODE_ROLE
 import net.corda.node.services.messaging.ArtemisMessagingServer.NodeLoginModule.Companion.PEER_ROLE
 import net.corda.node.services.messaging.ArtemisMessagingServer.NodeLoginModule.Companion.RPC_ROLE
@@ -35,6 +34,7 @@ import org.apache.activemq.artemis.spi.core.security.ActiveMQJAASSecurityManager
 import org.apache.activemq.artemis.spi.core.security.jaas.CertificateCallback
 import org.apache.activemq.artemis.spi.core.security.jaas.RolePrincipal
 import org.apache.activemq.artemis.spi.core.security.jaas.UserPrincipal
+import org.bouncycastle.asn1.x500.X500Name
 import rx.Subscription
 import java.io.IOException
 import java.math.BigInteger
@@ -52,6 +52,7 @@ import javax.security.auth.login.AppConfigurationEntry.LoginModuleControlFlag.RE
 import javax.security.auth.login.FailedLoginException
 import javax.security.auth.login.LoginException
 import javax.security.auth.spi.LoginModule
+import javax.security.cert.X509Certificate
 
 // TODO: Verify that nobody can connect to us and fiddle with our config over the socket due to the secman.
 // TODO: Implement a discovery engine that can trigger builds of new connections when another node registers? (later)
@@ -88,13 +89,15 @@ class ArtemisMessagingServer(override val config: NodeConfiguration,
     }
 
     /**
-     * The server will make sure the bridge exists on network map changes, see method [destroyOrCreateBridge]
+     * The server will make sure the bridge exists on network map changes, see method [updateBridgesOnNetworkChange]
      * We assume network map will be updated accordingly when the client node register with the network map server.
      */
     fun start() = mutex.locked {
         if (!running) {
             configureAndStartServer()
-            networkChangeHandle = networkMapCache.changed.subscribe { destroyOrCreateBridges(it) }
+            // Deploy bridge to the network map service
+            config.networkMapService?.let { deployBridge(NetworkMapAddress(it.address), it.legalName) }
+            networkChangeHandle = networkMapCache.changed.subscribe { updateBridgesOnNetworkChange(it) }
             running = true
         }
     }
@@ -106,48 +109,6 @@ class ArtemisMessagingServer(override val config: NodeConfiguration,
         running = false
     }
 
-    /**
-     * The bridge will be created automatically when the queues are created, however, this is not the case when the network map restarted.
-     * The queues are restored from the journal, and because the queues are added before we register the callback handler, this method will never get called for existing queues.
-     * This results in message queues up and never get send out. (https://github.com/corda/corda/issues/37)
-     *
-     * We create the bridges indirectly now because the network map is not persisted and there are no ways to obtain host and port information on startup.
-     * TODO : Create the bridge directly from the list of queues on start up when we have a persisted network map service.
-     */
-    private fun destroyOrCreateBridges(change: MapChange) {
-        fun addAddresses(node: NodeInfo, targets: MutableSet<ArtemisPeerAddress>) {
-            // Add the node's address with the p2p queue.
-            val nodeAddress = node.address as ArtemisPeerAddress
-            targets.add(nodeAddress)
-            // Add the node's address with service queues, one per service.
-            node.advertisedServices.forEach {
-                targets.add(NodeAddress.asService(it.identity.owningKey, nodeAddress.hostAndPort))
-            }
-        }
-
-        val addressesToCreateBridgesTo = HashSet<ArtemisPeerAddress>()
-        val addressesToRemoveBridgesFrom = HashSet<ArtemisPeerAddress>()
-        when (change) {
-            is MapChange.Modified -> {
-                addAddresses(change.node, addressesToCreateBridgesTo)
-                addAddresses(change.previousNode, addressesToRemoveBridgesFrom)
-            }
-            is MapChange.Removed -> {
-                addAddresses(change.node, addressesToRemoveBridgesFrom)
-            }
-            is MapChange.Added -> {
-                addAddresses(change.node, addressesToCreateBridgesTo)
-            }
-        }
-
-        (addressesToRemoveBridgesFrom - addressesToCreateBridgesTo).forEach {
-            activeMQServer.destroyBridge(getBridgeName(it.queueName, it.hostAndPort))
-        }
-        addressesToCreateBridgesTo.filter { activeMQServer.queueQuery(it.queueName).isExists }.forEach {
-            deployBridgeIfAbsent(it.queueName, it.hostAndPort)
-        }
-    }
-
     private fun configureAndStartServer() {
         val config = createArtemisConfig()
         val securityManager = createArtemisSecurityManager()
@@ -156,49 +117,11 @@ class ArtemisMessagingServer(override val config: NodeConfiguration,
             registerActivationFailureListener { exception -> throw exception }
             // Some types of queue might need special preparation on our side, like dialling back or preparing
             // a lazily initialised subsystem.
-            registerPostQueueCreationCallback { deployBridgeFromNewQueue(it) }
+            registerPostQueueCreationCallback { deployBridgesFromNewQueue(it.toString()) }
             registerPostQueueDeletionCallback { address, qName -> log.debug { "Queue deleted: $qName for $address" } }
         }
         activeMQServer.start()
         printBasicNodeInfo("Node listening on address", myHostPort.toString())
-    }
-
-    private fun maybeDeployBridgeForNode(queueName: SimpleString, nodeInfo: NodeInfo) {
-        val address = nodeInfo.address
-        if (address is ArtemisPeerAddress) {
-            log.debug("Deploying bridge for $queueName to $nodeInfo")
-            deployBridgeIfAbsent(queueName, address.hostAndPort)
-        } else {
-            log.error("Don't know how to deal with $address for queue $queueName")
-        }
-    }
-
-    private fun deployBridgeFromNewQueue(queueName: SimpleString) {
-        log.debug { "Queue created: $queueName, deploying bridge(s)" }
-        when {
-            queueName.startsWith(PEERS_PREFIX) -> try {
-                val identity = CompositeKey.parseFromBase58(queueName.substring(PEERS_PREFIX.length))
-                val nodeInfo = networkMapCache.getNodeByLegalIdentityKey(identity)
-                if (nodeInfo != null) {
-                    maybeDeployBridgeForNode(queueName, nodeInfo)
-                } else {
-                    log.error("Queue created for a peer that we don't know from the network map: $queueName")
-                }
-            } catch (e: AddressFormatException) {
-                log.error("Flow violation: Could not parse peer queue name as Base 58: $queueName")
-            }
-
-            queueName.startsWith(SERVICES_PREFIX) -> try {
-                val identity = CompositeKey.parseFromBase58(queueName.substring(SERVICES_PREFIX.length))
-                val nodeInfos = networkMapCache.getNodesByAdvertisedServiceIdentityKey(identity)
-                // Create a bridge for each node advertising the service.
-                for (nodeInfo in nodeInfos) {
-                    maybeDeployBridgeForNode(queueName, nodeInfo)
-                }
-            } catch (e: AddressFormatException) {
-                log.error("Flow violation: Could not parse service queue name as Base 58: $queueName")
-            }
-        }
     }
 
     private fun createArtemisConfig(): Configuration = ConfigurationImpl().apply {
@@ -206,7 +129,7 @@ class ArtemisMessagingServer(override val config: NodeConfiguration,
         bindingsDirectory = (artemisDir / "bindings").toString()
         journalDirectory = (artemisDir / "journal").toString()
         largeMessagesDirectory = (artemisDir / "large-messages").toString()
-        acceptorConfigurations = setOf(tcpTransport(INBOUND, "0.0.0.0", myHostPort.port))
+        acceptorConfigurations = setOf(tcpTransport(Inbound, "0.0.0.0", myHostPort.port))
         // Enable built in message deduplication. Note we still have to do our own as the delayed commits
         // and our own definition of commit mean that the built in deduplication cannot remove all duplicates.
         idCacheSize = 2000 // Artemis Default duplicate cache size i.e. a guess
@@ -215,40 +138,30 @@ class ArtemisMessagingServer(override val config: NodeConfiguration,
         managementNotificationAddress = SimpleString(NOTIFICATIONS_ADDRESS)
         // Artemis allows multiple servers to be grouped together into a cluster for load balancing purposes. The cluster
         // user is used for connecting the nodes together. It has super-user privileges and so it's imperative that its
-        // password is changed from the default (as warned in the docs). Since we don't need this feature we turn it off
+        // password be changed from the default (as warned in the docs). Since we don't need this feature we turn it off
         // by having its password be an unknown securely random 128-bit value.
         clusterPassword = BigInteger(128, newSecureRandom()).toString(16)
-
-        queueConfigurations.addAll(listOf(
-                CoreQueueConfiguration().apply {
-                    address = NETWORK_MAP_ADDRESS
-                    name = NETWORK_MAP_ADDRESS
-                    isDurable = true
-                },
-                CoreQueueConfiguration().apply {
-                    address = P2P_QUEUE
-                    name = P2P_QUEUE
-                    isDurable = true
-                },
-                // Create an RPC queue: this will service locally connected clients only (not via a bridge) and those
-                // clients must have authenticated. We could use a single consumer for everything and perhaps we should,
-                // but these queues are not worth persisting.
-                CoreQueueConfiguration().apply {
-                    name = RPC_REQUESTS_QUEUE
-                    address = RPC_REQUESTS_QUEUE
-                    isDurable = false
-                },
-                // The custom name for the queue is intentional - we may wish other things to subscribe to the
-                // NOTIFICATIONS_ADDRESS with different filters in future
-                CoreQueueConfiguration().apply {
-                    name = RPC_QUEUE_REMOVALS_QUEUE
-                    address = NOTIFICATIONS_ADDRESS
-                    isDurable = false
-                    filterString = "_AMQ_NotifType = 1"
-                }
-        ))
-
+        queueConfigurations = listOf(
+            queueConfig(NETWORK_MAP_QUEUE, durable = true),
+            queueConfig(P2P_QUEUE, durable = true),
+            // Create an RPC queue: this will service locally connected clients only (not via a bridge) and those
+            // clients must have authenticated. We could use a single consumer for everything and perhaps we should,
+            // but these queues are not worth persisting.
+            queueConfig(RPC_REQUESTS_QUEUE, durable = false),
+            // The custom name for the queue is intentional - we may wish other things to subscribe to the
+            // NOTIFICATIONS_ADDRESS with different filters in future
+            queueConfig(RPC_QUEUE_REMOVALS_QUEUE, address = NOTIFICATIONS_ADDRESS, filter = "_AMQ_NotifType = 1", durable = false)
+        )
         configureAddressSecurity()
+    }
+
+    private fun queueConfig(name: String, address: String = name, filter: String? = null, durable: Boolean): CoreQueueConfiguration {
+        return CoreQueueConfiguration().apply {
+            this.name = name
+            this.address = address
+            filterString = filter
+            isDurable = durable
+        }
     }
 
     /**
@@ -279,45 +192,114 @@ class ArtemisMessagingServer(override val config: NodeConfiguration,
     }
 
     private fun createArtemisSecurityManager(): ActiveMQJAASSecurityManager {
-        val ourRootCAPublicKey = X509Utilities
+        val rootCAPublicKey = X509Utilities
                 .loadCertificateFromKeyStore(config.trustStorePath, config.trustStorePassword, CORDA_ROOT_CA)
                 .publicKey
-        val ourPublicKey = X509Utilities
+        val ourCertificate = X509Utilities
                 .loadCertificateFromKeyStore(config.keyStorePath, config.keyStorePassword, CORDA_CLIENT_CA)
-                .publicKey
+        val ourSubjectDN = X500Name(ourCertificate.subjectDN.name)
+        // This is a sanity check and should not fail unless things have been misconfigured
+        require(ourSubjectDN.commonName == config.myLegalName) {
+            "Legal name does not match with our subject CN: $ourSubjectDN"
+        }
         val securityConfig = object : SecurityConfiguration() {
             // Override to make it work with our login module
             override fun getAppConfigurationEntry(name: String): Array<AppConfigurationEntry> {
                 val options = mapOf(
                         RPCUserService::class.java.name to userService,
-                        CORDA_ROOT_CA to ourRootCAPublicKey,
-                        CORDA_CLIENT_CA to ourPublicKey)
+                        CORDA_ROOT_CA to rootCAPublicKey,
+                        CORDA_CLIENT_CA to ourCertificate.publicKey)
                 return arrayOf(AppConfigurationEntry(name, REQUIRED, options))
             }
         }
         return ActiveMQJAASSecurityManager(NodeLoginModule::class.java.name, securityConfig)
     }
 
-    private fun connectorExists(hostAndPort: HostAndPort) = hostAndPort.toString() in activeMQServer.configuration.connectorConfigurations
+    private fun deployBridgesFromNewQueue(queueName: String) {
+        log.debug { "Queue created: $queueName, deploying bridge(s)" }
 
-    private fun addConnector(hostAndPort: HostAndPort) = activeMQServer.configuration.addConnectorConfiguration(
-            hostAndPort.toString(),
-            tcpTransport(OUTBOUND, hostAndPort.hostText, hostAndPort.port)
-    )
-
-    private fun bridgeExists(name: String) = activeMQServer.clusterManager.bridges.containsKey(name)
-
-    fun deployBridgeIfAbsent(queueName: SimpleString, hostAndPort: HostAndPort) {
-        if (!connectorExists(hostAndPort)) {
-            addConnector(hostAndPort)
+        fun deployBridgeToPeer(nodeInfo: NodeInfo) {
+            log.debug("Deploying bridge for $queueName to $nodeInfo")
+            val address = nodeInfo.address
+            if (address is ArtemisPeerAddress) {
+                deployBridge(queueName, address.hostAndPort, nodeInfo.legalIdentity.name)
+            } else {
+                log.error("Don't know how to deal with $address for queue $queueName")
+            }
         }
-        val bridgeName = getBridgeName(queueName, hostAndPort)
-        if (!bridgeExists(bridgeName)) {
-            deployBridge(bridgeName, queueName, hostAndPort)
+
+        when {
+            queueName.startsWith(PEERS_PREFIX) -> try {
+                val identity = CompositeKey.parseFromBase58(queueName.substring(PEERS_PREFIX.length))
+                val nodeInfo = networkMapCache.getNodeByLegalIdentityKey(identity)
+                if (nodeInfo != null) {
+                    deployBridgeToPeer(nodeInfo)
+                } else {
+                    log.error("Queue created for a peer that we don't know from the network map: $queueName")
+                }
+            } catch (e: AddressFormatException) {
+                log.error("Flow violation: Could not parse peer queue name as Base 58: $queueName")
+            }
+
+            queueName.startsWith(SERVICES_PREFIX) -> try {
+                val identity = CompositeKey.parseFromBase58(queueName.substring(SERVICES_PREFIX.length))
+                val nodeInfos = networkMapCache.getNodesByAdvertisedServiceIdentityKey(identity)
+                // Create a bridge for each node advertising the service.
+                for (nodeInfo in nodeInfos) {
+                    deployBridgeToPeer(nodeInfo)
+                }
+            } catch (e: AddressFormatException) {
+                log.error("Flow violation: Could not parse service queue name as Base 58: $queueName")
+            }
         }
     }
 
-    private fun getBridgeName(queueName: SimpleString, hostAndPort: HostAndPort) = "$queueName -> $hostAndPort"
+    /**
+     * The bridge will be created automatically when the queues are created, however, this is not the case when the network map restarted.
+     * The queues are restored from the journal, and because the queues are added before we register the callback handler, this method will never get called for existing queues.
+     * This results in message queues up and never get send out. (https://github.com/corda/corda/issues/37)
+     *
+     * We create the bridges indirectly now because the network map is not persisted and there are no ways to obtain host and port information on startup.
+     * TODO : Create the bridge directly from the list of queues on start up when we have a persisted network map service.
+     */
+    private fun updateBridgesOnNetworkChange(change: MapChange) {
+        fun gatherAddresses(node: NodeInfo): Sequence<ArtemisPeerAddress> {
+            val peerAddress = node.address as ArtemisPeerAddress
+            val addresses = mutableListOf(peerAddress)
+            node.advertisedServices.mapTo(addresses) { NodeAddress.asService(it.identity.owningKey, peerAddress.hostAndPort) }
+            return addresses.asSequence()
+        }
+
+        fun deployBridges(node: NodeInfo) {
+            gatherAddresses(node)
+                .filter { queueExists(it.queueName) && !bridgeExists(it.bridgeName) }
+                .forEach { deployBridge(it, node.legalIdentity.name) }
+        }
+
+        fun destroyBridges(node: NodeInfo) {
+            gatherAddresses(node).forEach {
+                activeMQServer.destroyBridge(it.bridgeName)
+            }
+        }
+
+        when (change) {
+            is MapChange.Added -> {
+                deployBridges(change.node)
+            }
+            is MapChange.Removed -> {
+                destroyBridges(change.node)
+            }
+            is MapChange.Modified -> {
+                // TODO Figure out what has actually changed and only destroy those bridges that need to be.
+                destroyBridges(change.previousNode)
+                deployBridges(change.node)
+            }
+        }
+    }
+
+    private fun deployBridge(address: ArtemisPeerAddress, legalName: String) {
+        deployBridge(address.queueName, address.hostAndPort, legalName)
+    }
 
     /**
      * All nodes are expected to have a public facing address called [ArtemisMessagingComponent.P2P_QUEUE] for receiving
@@ -325,20 +307,39 @@ class ArtemisMessagingServer(override val config: NodeConfiguration,
      * as defined by ArtemisAddress.queueName. A bridge is then created to forward messages from this queue to the node's
      * P2P address.
      */
-    private fun deployBridge(bridgeName: String, queueName: SimpleString, hostAndPort: HostAndPort) {
+    private fun deployBridge(queueName: String, target: HostAndPort, legalName: String) {
+        // We intentionally overwrite any previous connector config in case the peer legal name changed
+        activeMQServer.configuration.addConnectorConfiguration(
+                target.toString(),
+                tcpTransport(Outbound(expectedCommonName = legalName), target.hostText, target.port))
+
         activeMQServer.deployBridge(BridgeConfiguration().apply {
-            name = bridgeName
-            this.queueName = queueName.toString()
+            name = getBridgeName(queueName, target)
+            this.queueName = queueName
             forwardingAddress = P2P_QUEUE
-            staticConnectors = listOf(hostAndPort.toString())
+            staticConnectors = listOf(target.toString())
             confirmationWindowSize = 100000 // a guess
             isUseDuplicateDetection = true // Enable the bridge's automatic deduplication logic
+            // We keep trying until the network map deems the node unreachable and tells us it's been removed at which
+            // point we destroy the bridge
+            // TODO Give some thought to the retry settings
+            retryInterval = 5.seconds.toMillis()
+            retryIntervalMultiplier = 1.5  // Exponential backoff
+            maxRetryInterval = 30.minutes.toMillis()
             // As a peer of the target node we must connect to it using the peer user. Actual authentication is done using
             // our TLS certificate.
             user = PEER_USER
             password = PEER_USER
         })
     }
+
+    private fun queueExists(queueName: String): Boolean = activeMQServer.queueQuery(SimpleString(queueName)).isExists
+
+    private fun bridgeExists(bridgeName: String): Boolean = activeMQServer.clusterManager.bridges.containsKey(bridgeName)
+
+    private val ArtemisPeerAddress.bridgeName: String get() = getBridgeName(queueName, hostAndPort)
+
+    private fun getBridgeName(queueName: String, hostAndPort: HostAndPort): String = "$queueName -> $hostAndPort"
 
     /**
      * Clients must connect to us with a username and password and must use TLS. If a someone connects with
@@ -394,37 +395,45 @@ class ArtemisMessagingServer(override val config: NodeConfiguration,
 
             val validatedUser = if (username == PEER_USER || username == NODE_USER) {
                 val certificates = certificateCallback.certificates ?: throw FailedLoginException("No TLS?")
-                val peerCertificate = certificates.first()
-                val role = if (username == NODE_USER) {
-                    if (peerCertificate.publicKey != ourPublicKey) {
-                        throw FailedLoginException("Only the node can login as $NODE_USER")
-                    }
-                    NODE_ROLE
-                } else {
-                    val theirRootCAPublicKey = certificates.last().publicKey
-                    if (theirRootCAPublicKey != ourRootCAPublicKey) {
-                        throw FailedLoginException("Peer does not belong on our network. Their root CA: $theirRootCAPublicKey")
-                    }
-                    PEER_ROLE  // This enables the peer to send to our P2P address
-                }
-                principals += RolePrincipal(role)
-                peerCertificate.subjectDN.name
+                authenticateNode(certificates, username)
             } else {
                 // Otherwise assume they're an RPC user
-                val rpcUser = userService.getUser(username) ?: throw FailedLoginException("User does not exist")
-                if (password != rpcUser.password) {
-                    // TODO Switch to hashed passwords
-                    // TODO Retrieve client IP address to include in exception message
-                    throw FailedLoginException("Password for user $username does not match")
-                }
-                principals += RolePrincipal(RPC_ROLE)  // This enables the RPC client to send requests
-                principals += RolePrincipal("$CLIENTS_PREFIX$username")  // This enables the RPC client to receive responses
-                username
+                authenticateRpcUser(password, username)
             }
             principals += UserPrincipal(validatedUser)
 
             loginSucceeded = true
             return loginSucceeded
+        }
+
+        private fun authenticateNode(certificates: Array<X509Certificate>, username: String): String {
+            val peerCertificate = certificates.first()
+            val role = if (username == NODE_USER) {
+                if (peerCertificate.publicKey != ourPublicKey) {
+                    throw FailedLoginException("Only the node can login as $NODE_USER")
+                }
+                NODE_ROLE
+            } else {
+                val theirRootCAPublicKey = certificates.last().publicKey
+                if (theirRootCAPublicKey != ourRootCAPublicKey) {
+                    throw FailedLoginException("Peer does not belong on our network. Their root CA: $theirRootCAPublicKey")
+                }
+                PEER_ROLE  // This enables the peer to send to our P2P address
+            }
+            principals += RolePrincipal(role)
+            return peerCertificate.subjectDN.name
+        }
+
+        private fun authenticateRpcUser(password: String, username: String): String {
+            val rpcUser = userService.getUser(username) ?: throw FailedLoginException("User does not exist")
+            if (password != rpcUser.password) {
+                // TODO Switch to hashed passwords
+                // TODO Retrieve client IP address to include in exception message
+                throw FailedLoginException("Password for user $username does not match")
+            }
+            principals += RolePrincipal(RPC_ROLE)  // This enables the RPC client to send requests
+            principals += RolePrincipal("$CLIENTS_PREFIX$username")  // This enables the RPC client to receive responses
+            return username
         }
 
         override fun commit(): Boolean {
