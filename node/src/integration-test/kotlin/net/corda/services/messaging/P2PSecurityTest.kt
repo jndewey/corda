@@ -2,12 +2,9 @@ package net.corda.services.messaging
 
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.support.jdk7.use
+import net.corda.core.*
 import net.corda.core.crypto.Party
-import net.corda.core.div
-import net.corda.core.getOrThrow
 import net.corda.core.node.NodeInfo
-import net.corda.core.random63BitValue
-import net.corda.core.seconds
 import net.corda.flows.sendRequest
 import net.corda.node.internal.NetworkMapInfo
 import net.corda.node.services.config.configureWithDevSSLCertificate
@@ -17,7 +14,6 @@ import net.corda.node.services.network.NetworkMapService.RegistrationRequest
 import net.corda.node.services.network.NodeRegistration
 import net.corda.node.utilities.AddOrRemove
 import net.corda.testing.TestNodeConfiguration
-import net.corda.testing.elapsedTime
 import net.corda.testing.node.NodeBasedTest
 import net.corda.testing.node.SimpleNode
 import org.assertj.core.api.Assertions.assertThatExceptionOfType

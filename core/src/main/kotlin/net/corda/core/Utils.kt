@@ -12,7 +12,6 @@ import com.google.common.util.concurrent.MoreExecutors
 import com.google.common.util.concurrent.SettableFuture
 import kotlinx.support.jdk7.use
 import net.corda.core.crypto.newSecureRandom
-import org.slf4j.Logger
 import rx.Observable
 import rx.Observer
 import rx.subjects.PublishSubject
@@ -202,17 +201,11 @@ fun <T> List<T>.randomOrNull(predicate: (T) -> Boolean) = filter(predicate).rand
 // An alias that can sometimes make code clearer to read.
 val RunOnCallerThread: Executor = MoreExecutors.directExecutor()
 
-// TODO: Add inline back when a new Kotlin version is released and check if the java.lang.VerifyError
-// returns in the IRSSimulationTest. If not, commit the inline back.
-fun <T> logElapsedTime(label: String, logger: Logger? = null, body: () -> T): T {
-    val now = System.currentTimeMillis()
-    val r = body()
-    val elapsed = System.currentTimeMillis() - now
-    if (logger != null)
-        logger.info("$label took $elapsed msec")
-    else
-        println("$label took $elapsed msec")
-    return r
+inline fun elapsedTime(block: () -> Unit): Duration {
+    val start = System.nanoTime()
+    block()
+    val end = System.nanoTime()
+    return Duration.ofNanos(end-start)
 }
 
 /**
@@ -269,19 +262,17 @@ class TransientProperty<out T>(private val initializer: () -> T) {
 /**
  * Given a path to a zip file, extracts it to the given directory.
  */
-fun extractZipFile(zipPath: Path, toPath: Path) {
-    val normalisedToPath = toPath.normalize()
-    normalisedToPath.createDirectories()
+fun extractZipFile(zipFile: Path, toDirectory: Path) {
+    val normalisedDirectory = toDirectory.normalize().createDirectories()
 
-    zipPath.read {
+    zipFile.read {
         val zip = ZipInputStream(BufferedInputStream(it))
         while (true) {
             val e = zip.nextEntry ?: break
-            val outPath = normalisedToPath / e.name
+            val outPath = (normalisedDirectory / e.name).normalize()
 
-            // Security checks: we should reject a zip that contains tricksy paths that try to escape toPath.
-            if (!outPath.normalize().startsWith(normalisedToPath))
-                throw IllegalStateException("ZIP contained a path that resolved incorrectly: ${e.name}")
+            // Security checks: we should reject a zip that contains tricksy paths that try to escape toDirectory.
+            check(outPath.startsWith(normalisedDirectory)) { "ZIP contained a path that resolved incorrectly: ${e.name}" }
 
             if (e.isDirectory) {
                 outPath.createDirectories()
