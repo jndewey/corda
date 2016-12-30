@@ -44,11 +44,7 @@ class FullNodeConfiguration(val config: Config) : NodeConfiguration {
     override val trustStorePassword: String by config
     override val dataSourceProperties: Properties by config
     override val devMode: Boolean by config.getOrElse { false }
-    override val networkMapService: NetworkMapInfo? = config.getOptionalConfig("networkMapService")?.run {
-        NetworkMapInfo(
-                HostAndPort.fromString(getString("address")),
-                getString("legalName"))
-    }
+    override val networkMapService: NetworkMapInfo? by config.getOrElse { null }
     override val rpcUsers: List<User> = config
             .getListOrElse<Config>("rpcUsers") { emptyList() }
             .map {
@@ -62,12 +58,11 @@ class FullNodeConfiguration(val config: Config) : NodeConfiguration {
     val artemisAddress: HostAndPort by config
     val webAddress: HostAndPort by config
     val messagingServerAddress: HostAndPort? by config.getOrElse { null }
+    // TODO Make this a List<String>
     val extraAdvertisedServiceIds: String by config
     val useTestClock: Boolean by config.getOrElse { false }
     val notaryNodeAddress: HostAndPort? by config.getOrElse { null }
-    val notaryClusterAddresses: List<HostAndPort> = config
-            .getListOrElse<String>("notaryClusterAddresses") { emptyList() }
-            .map { HostAndPort.fromString(it) }
+    val notaryClusterAddresses: List<HostAndPort> by config.getOrElse { emptyList<HostAndPort>() }
 
     fun createNode(): Node {
         // This is a sanity feature do not remove.
@@ -83,5 +78,3 @@ class FullNodeConfiguration(val config: Config) : NodeConfiguration {
         return Node(this, advertisedServices, if (useTestClock) TestClock() else NodeClock())
     }
 }
-
-private fun Config.getOptionalConfig(path: String): Config? = if (hasPath(path)) getConfig(path) else null
