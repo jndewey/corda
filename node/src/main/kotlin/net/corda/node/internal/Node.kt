@@ -120,7 +120,7 @@ class Node(override val configuration: FullNodeConfiguration,
     private lateinit var userService: RPCUserService
 
     override fun makeMessagingService(): MessagingServiceInternal {
-        userService = RPCUserServiceImpl(configuration)
+        userService = RPCUserServiceImpl(configuration.rpcUsers)
 
         val serverAddress = with(configuration) {
             messagingServerAddress ?: {

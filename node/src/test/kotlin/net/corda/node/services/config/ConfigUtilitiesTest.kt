@@ -2,6 +2,7 @@ package net.corda.node.services.config
 
 import com.google.common.net.HostAndPort
 import com.typesafe.config.Config
+import com.typesafe.config.ConfigFactory.empty
 import com.typesafe.config.ConfigRenderOptions.defaults
 import com.typesafe.config.ConfigValueFactory
 import net.corda.core.div
@@ -203,6 +204,22 @@ class ConfigUtilitiesTest {
     }
 
     @Test
+    fun `empty List`() {
+        class ListTest(config: Config) {
+            val value: List<String> by config
+        }
+        assertThat(ListTest(config("value" to emptyList<String>())).value).isEmpty()
+    }
+
+    @Test
+    fun `Set config`() {
+        class SetTest(config : Config) {
+            val value: Set<String> by config
+        }
+        assertThat(SetTest(config("value" to listOf("a", "a", "b"))).value).isEqualTo(setOf("a", "b"))
+    }
+
+    @Test
     fun `data class with single property`() {
         class DataTest(config: Config) {
             val value: SingleData by config
@@ -250,6 +267,23 @@ class ConfigUtilitiesTest {
         assertThat(DataTest(config("value" to mapOf("l" to listOf(1, 2)))).value).isEqualTo(ListData(listOf(1, 2)))
     }
 
+    @Test
+    fun `data class with default value property`() {
+        class DataTest(config: Config) {
+            val value: DefaultData by config
+        }
+        assertThat(DataTest(config("value" to mapOf("a" to 3))).value).isEqualTo(DefaultData(3, 2))
+        assertThat(DataTest(config("value" to mapOf("a" to 3, "defaultOfTwo" to 3))).value).isEqualTo(DefaultData(3, 3))
+    }
+
+    @Test
+    fun `default config value`() {
+        class OptionalTest(config : Config) {
+            val value: String by config.orElse { "else" }
+        }
+        assertThat(OptionalTest(empty()).value).isEqualTo("else")
+    }
+
     private fun config(vararg values: Pair<String, *>): Config {
         val config = ConfigValueFactory.fromMap(mapOf(*values))
         println(config.render(defaults().setOriginComments(false)))
@@ -260,4 +294,5 @@ class ConfigUtilitiesTest {
     data class DoubleData(val i: Int, val b: Boolean)
     data class NestedData(val d: SingleData)
     data class ListData(val l: List<Int>)
+    data class DefaultData(val a: Int, val defaultOfTwo: Int = 2)
 }

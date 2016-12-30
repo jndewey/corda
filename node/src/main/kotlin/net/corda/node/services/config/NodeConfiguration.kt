@@ -43,26 +43,24 @@ class FullNodeConfiguration(val config: Config) : NodeConfiguration {
     override val keyStorePassword: String by config
     override val trustStorePassword: String by config
     override val dataSourceProperties: Properties by config
-    override val devMode: Boolean by config.getOrElse { false }
-    override val networkMapService: NetworkMapInfo? by config.getOrElse { null }
-    override val rpcUsers: List<User> = config
-            .getListOrElse<Config>("rpcUsers") { emptyList() }
-            .map {
-                val username = it.getString("user")
-                require(username.matches("\\w+".toRegex())) { "Username $username contains invalid characters" }
-                val password = it.getString("password")
-                val permissions = it.getListOrElse<String>("permissions") { emptyList() }.toSet()
-                User(username, password, permissions)
-            }
+    override val devMode: Boolean by config.orElse { false }
+    override val networkMapService: NetworkMapInfo? by config.orElse { null }
+    override val rpcUsers: List<User> by config.orElse { emptyList<User>() }
     val useHTTPS: Boolean by config
     val artemisAddress: HostAndPort by config
     val webAddress: HostAndPort by config
-    val messagingServerAddress: HostAndPort? by config.getOrElse { null }
-    // TODO Make this a List<String>
+    val messagingServerAddress: HostAndPort? by config.orElse { null }
+    // TODO Make this a List<String> or even Set<ServiceInfo>
     val extraAdvertisedServiceIds: String by config
-    val useTestClock: Boolean by config.getOrElse { false }
-    val notaryNodeAddress: HostAndPort? by config.getOrElse { null }
-    val notaryClusterAddresses: List<HostAndPort> by config.getOrElse { emptyList<HostAndPort>() }
+    val useTestClock: Boolean by config.orElse { false }
+    val notaryNodeAddress: HostAndPort? by config.orElse { null }
+    val notaryClusterAddresses: List<HostAndPort> by config.orElse { emptyList<HostAndPort>() }
+
+    init {
+        rpcUsers.forEach {
+            require(it.username.matches("\\w+".toRegex())) { "Username ${it.username} contains invalid characters" }
+        }
+    }
 
     fun createNode(): Node {
         // This is a sanity feature do not remove.

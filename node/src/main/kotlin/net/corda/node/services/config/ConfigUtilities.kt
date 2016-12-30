@@ -55,63 +55,69 @@ operator fun <T> Config.getValue(receiver: Any, metadata: KProperty<*>): T {
 @Suppress("UNCHECKED_CAST")
 private fun <T> Config.getValueInternal(path: String, type: Type): T {
     return when (type) {
-        String::class.java -> getString(path) as T
-        Int::class.java -> getInt(path) as T
-        Long::class.java -> getLong(path) as T
-        Double::class.java -> getDouble(path) as T
-        Boolean::class.java -> getBoolean(path) as T
-        LocalDate::class.java -> LocalDate.parse(getString(path)) as T
-        Instant::class.java -> Instant.parse(getString(path)) as T
-        HostAndPort::class.java -> HostAndPort.fromString(getString(path)) as T
-        Path::class.java -> Paths.get(getString(path)) as T
-        URL::class.java -> URL(getString(path)) as T
-        Properties::class.java -> getObject(path).toProperties() as T
+        String::class.java -> getString(path)
+        Int::class.java -> getInt(path)
+        Long::class.java -> getLong(path)
+        Double::class.java -> getDouble(path)
+        Boolean::class.java -> getBoolean(path)
+        LocalDate::class.java -> LocalDate.parse(getString(path))
+        Instant::class.java -> Instant.parse(getString(path))
+        HostAndPort::class.java -> HostAndPort.fromString(getString(path))
+        Path::class.java -> Paths.get(getString(path))
+        URL::class.java -> URL(getString(path))
+        Properties::class.java -> getObject(path).toProperties()
         is ParameterizedType -> getParameterisedValue<T>(path, type)
-        else -> getConfig(path).getBean(type as Class<*>) as T
-    }
+        else -> getConfig(path).toObjectGraph(type as Class<*>)
+    } as T
 }
 
 @Suppress("UNCHECKED_CAST", "PLATFORM_CLASS_MAPPED_TO_KOTLIN")
 private fun <T> Config.getParameterisedValue(path: String, type: ParameterizedType): T {
-    check(List::class.java.isAssignableFrom(type.rawType as Class<*>)) { "$type is not supported" }
-    val argType = type.actualTypeArguments[0]
-    return when (argType) {
-        String::class.java -> getStringList(path) as T
-        Integer::class.java -> getIntList(path) as T
-        java.lang.Long::class.java -> getLongList(path) as T
-        java.lang.Double::class.java -> getDoubleList(path) as T
-        java.lang.Boolean::class.java -> getBooleanList(path) as T
-        LocalDate::class.java -> getStringList(path).map { LocalDate.parse(it) } as T
-        Instant::class.java -> getStringList(path).map { Instant.parse(it) } as T
-        HostAndPort::class.java -> getStringList(path).map { HostAndPort.fromString(it) } as T
-        Path::class.java -> getStringList(path).map { Paths.get(it) } as T
-        URL::class.java -> getStringList(path).map(::URL) as T
-        Properties::class.java -> getObjectList(path).map { it.toProperties() } as T
-        else -> getConfigList(path).map { it.getBean(argType as Class<*>) } as T
+    val rawType = type.rawType as Class<*>
+    require(Collection::class.java.isAssignableFrom(rawType)) { "$rawType is not supported" }
+    val argType = type.actualTypeArguments[0] as Class<*>
+    val values: List<Any> = when (argType) {
+        String::class.java -> getStringList(path)
+        Integer::class.java -> getIntList(path)
+        java.lang.Long::class.java -> getLongList(path)
+        java.lang.Double::class.java -> getDoubleList(path)
+        java.lang.Boolean::class.java -> getBooleanList(path)
+        LocalDate::class.java -> getStringList(path).map { LocalDate.parse(it) }
+        Instant::class.java -> getStringList(path).map { Instant.parse(it) }
+        HostAndPort::class.java -> getStringList(path).map { HostAndPort.fromString(it) }
+        Path::class.java -> getStringList(path).map { Paths.get(it) }
+        URL::class.java -> getStringList(path).map(::URL)
+        Properties::class.java -> getObjectList(path).map { it.toProperties() }
+        else -> getConfigList(path).map { it.toObjectGraph(argType) }
     }
+    return when (rawType) {
+        List::class.java -> values
+        Set::class.java -> values.toSet()
+        else -> throw IllegalArgumentException("$rawType is not supported")
+    } as T
 }
 
-fun <T : Any> Config.getBean(type: Class<T>): T {
+fun <T : Any> Config.toObjectGraph(type: Class<T>): T {
     val constructor = type.kotlin.constructors.maxBy { it.parameters.size }
             ?: throw IllegalArgumentException("${type.name} has no constructors")
-    require(constructor.parameters.isNotEmpty()) { "${type.name} only has a no-arg constructor" }
-    require(constructor.parameters.all { it.name != null }) { "Missing parameter names in $constructor: ${constructor.parameters}" }
-    val args = constructor.parameters.map { getValueInternal<Any>(it.name!!, it.type.javaType) }.toTypedArray()
-    return constructor.call(*args)
+    val args = constructor.parameters
+            .filterNot { it.isOptional && !hasPath(it.name!!) }
+            .associateBy({ it }) { getValueInternal<Any>(it.name!!, it.type.javaType) }
+    return constructor.callBy(args)
 }
 
 /**
  * Helper class for optional configurations
  */
-class OptionalConfig<out T>(val conf: Config, val default: () -> T) {
+class OptionalConfig<out T>(val config: Config, val default: () -> T) {
     operator fun getValue(receiver: Any, metadata: KProperty<*>): T {
-        return if (conf.hasPath(metadata.name)) conf.getValue(receiver, metadata) else default()
+        return if (config.hasPath(metadata.name)) config.getValue(receiver, metadata) else default()
     }
 }
 
-fun <T> Config.getOrElse(default: () -> T): OptionalConfig<T> = OptionalConfig(this, default)
+fun <T> Config.orElse(default: () -> T): OptionalConfig<T> = OptionalConfig(this, default)
 
-private fun ConfigObject.toProperties(): Properties = mapValuesTo(Properties()) { it.value.unwrapped().toString() }
+private fun ConfigObject.toProperties(): Properties = this.mapValuesTo(Properties()) { it.value.unwrapped().toString() }
 
 @Suppress("UNCHECKED_CAST")
 inline fun <reified T : Any> Config.getListOrElse(path: String, default: Config.() -> List<T>): List<T> {

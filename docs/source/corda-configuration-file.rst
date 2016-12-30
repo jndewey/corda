@@ -116,7 +116,7 @@ Fields
 :rpcUsers: A list of users who are authorised to access the RPC system. Each user in the list is a config object with the
     following fields:
 
-        :user: Username consisting only of word characters (a-z, A-Z, 0-9 and _)
+        :username: Username consisting only of word characters (a-z, A-Z, 0-9 and _)
         :password: The password
         :permissions: A list of permission strings which RPC methods can use to control access
 
